@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Strix AI Pentesting — GitLab CI/CD Template
+#
+# HOW TO USE:
+#   1. Add your LLM API key in GitLab CI/CD Variables:
+#        Settings → CI/CD → Variables → Add variable
+#        Key: GROQ_API_KEY  (or GEMINI_API_KEY, etc.)
+#   2. Add STRIX_TARGET variable with the URL to scan.
+#   3. (Optional) Add STRIX_AUTH_TOKEN for authenticated scans.
+#   4. Commit this file as .gitlab-ci.yml in your repo root.
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - security-scan
+
+variables:
+  STRIX_VERSION: "latest"
+  STRIX_PROFILE: "normal"
+  STRIX_FAIL_SEVERITY: "high"  # Fail pipeline at this severity or above.
+
+strix-security-scan:
+  stage: security-scan
+  image: python:3.11-slim
+
+  # Run nightly and on merge requests to protected branches.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|master)$/'
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|master)$/'
+    - if: '$CI_PIPELINE_SOURCE == "web"'   # Manual trigger from UI
+
+  before_script:
+    - pip install --upgrade pip
+    - pip install strix-pentest==${STRIX_VERSION} || pip install strix-pentest
+
+  script:
+    - mkdir -p strix-results
+    - |
+      strix scan \
+        --target "${STRIX_TARGET}" \
+        --profile "${STRIX_PROFILE}" \
+        --output-dir strix-results \
+        --format json \
+        --format sarif \
+        --format html \
+        || true
+    # Check severity threshold
+    - |
+      python3 - <<'EOF'
+      import json, sys, os
+
+      results_file = "strix-results/vulnerabilities.json"
+      if not os.path.exists(results_file):
+          print("No results file — scan may have errored.")
+          sys.exit(0)
+
+      severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+      threshold_str = os.environ.get("STRIX_FAIL_SEVERITY", "high")
+      threshold = severity_order.get(threshold_str, 1)
+
+      with open(results_file) as f:
+          data = json.load(f)
+      findings = data if isinstance(data, list) else data.get("vulnerabilities", [])
+      blockers = [f for f in findings if severity_order.get(str(f.get("severity","")).lower(), 5) <= threshold]
+
+      if blockers:
+          print(f"\n❌ {len(blockers)} finding(s) at or above {threshold_str} severity:")
+          for f in blockers[:10]:
+              print(f"  [{f.get('severity','?').upper()}] {f.get('title','Unknown')} — {f.get('endpoint','')}")
+          sys.exit(1)
+      else:
+          print(f"✅ No findings at or above {threshold_str} severity.")
+      EOF
+
+  variables:
+    # LLM provider — set in GitLab CI/CD Variables, not here.
+    STRIX_LLM: "groq/llama-3.3-70b-versatile"
+    STRIX_TELEMETRY: "false"
+
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - strix-results/
+    reports:
+      # GitLab SAST report integration (if using SARIF → SAST converter).
+      # sast: strix-results/scan_report.sarif
+
+  # Schedule via GitLab CI Schedules (Settings → CI/CD → Schedules):
+  # Add a schedule with cron "0 2 * * *" pointing to main/master.

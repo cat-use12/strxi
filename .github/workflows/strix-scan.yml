@@ -1,0 +1,222 @@
+name: Strix Security Scan
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strix AI Pentesting — GitHub Actions CI/CD Template
+#
+# HOW TO USE:
+#   1. Add your LLM API key as a GitHub repository secret:
+#        Settings → Secrets → Actions → New repository secret
+#        Name: GROQ_API_KEY  (or GEMINI_API_KEY, OPENAI_API_KEY, etc.)
+#   2. Add your target URL as a secret or variable:
+#        Name: STRIX_TARGET
+#   3. (Optional) Add STRIX_AUTH_TOKEN if your target requires authentication
+#   4. Commit this file. The workflow runs on every push to main/master
+#      and on a nightly schedule.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  # Run on every push to main/master — catches regressions early.
+  push:
+    branches: [ main, master ]
+
+  # Nightly scheduled scan at 02:00 UTC.
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Allow manual trigger with a custom target override.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target URL to scan (overrides STRIX_TARGET secret)'
+        required: false
+        default: ''
+      profile:
+        description: 'Strix profile: normal, stealth, aggressive, api-only, recon, quick'
+        required: false
+        default: 'normal'
+      severity:
+        description: 'Minimum severity to fail the build: critical, high, medium, low'
+        required: false
+        default: 'high'
+
+env:
+  STRIX_VERSION: "latest"  # Pin to a specific version like "v1.2.3" in production.
+
+jobs:
+  strix-scan:
+    name: Strix Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # Only run on the main/master branch (or manual dispatch).
+    # Remove this filter if you want to scan on all branches.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+
+    permissions:
+      contents: read
+      issues: write        # Required if STRIX_CREATE_ISSUES=true
+      security-events: write  # Required for SARIF upload
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Strix
+        run: |
+          pip install --upgrade pip
+          pip install strix-pentest==${{ env.STRIX_VERSION }} || pip install strix-pentest
+
+      # Optional: install nuclei for template-based scanning.
+      - name: Install Nuclei (optional)
+        continue-on-error: true
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Determine scan target
+        id: target
+        run: |
+          TARGET="${{ github.event.inputs.target }}"
+          if [ -z "$TARGET" ]; then
+            TARGET="${{ secrets.STRIX_TARGET }}"
+          fi
+          if [ -z "$TARGET" ]; then
+            echo "::error::No scan target set. Add STRIX_TARGET secret or pass target as workflow input."
+            exit 1
+          fi
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+
+      - name: Run Strix scan
+        id: scan
+        env:
+          # LLM provider — set the one you use in GitHub Secrets.
+          GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          # Model configuration (set in secrets or hardcode here).
+          STRIX_LLM:       ${{ secrets.STRIX_LLM || 'groq/llama-3.3-70b-versatile' }}
+          STRIX_LLM_FAST:  ${{ secrets.STRIX_LLM_FAST }}
+          STRIX_LLM_CODE:  ${{ secrets.STRIX_LLM_CODE }}
+
+          # Scan settings.
+          STRIX_AUTH_TOKEN: ${{ secrets.STRIX_AUTH_TOKEN }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:      ${{ github.repository }}
+
+          # Telemetry — set to false to opt out.
+          STRIX_TELEMETRY: "false"
+
+        run: |
+          PROFILE="${{ github.event.inputs.profile || 'normal' }}"
+          SEVERITY="${{ github.event.inputs.severity || 'high' }}"
+
+          mkdir -p strix-results
+
+          strix scan \
+            --target "${{ steps.target.outputs.target }}" \
+            --profile "$PROFILE" \
+            --output-dir strix-results \
+            --format json \
+            --format sarif \
+            --format html \
+            || true   # Don't fail here — check severity threshold below.
+
+          echo "scan_dir=strix-results" >> $GITHUB_OUTPUT
+
+      - name: Check severity threshold
+        run: |
+          SEVERITY="${{ github.event.inputs.severity || 'high' }}"
+          RESULTS_FILE="strix-results/vulnerabilities.json"
+
+          if [ ! -f "$RESULTS_FILE" ]; then
+            echo "No results file found — scan may have errored."
+            exit 0
+          fi
+
+          python3 - <<'EOF'
+          import json, sys, os
+
+          severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+          threshold_str = os.environ.get("SEVERITY", "high")
+          threshold = severity_order.get(threshold_str, 1)
+
+          with open("strix-results/vulnerabilities.json") as f:
+              findings = json.load(f)
+          if isinstance(findings, dict):
+              findings = findings.get("vulnerabilities", findings.get("findings", []))
+
+          blockers = [
+              f for f in findings
+              if severity_order.get(str(f.get("severity","")).lower(), 5) <= threshold
+          ]
+
+          if blockers:
+              print(f"\n❌ SECURITY GATE FAILED: {len(blockers)} finding(s) at or above {threshold_str} severity:")
+              for f in blockers[:10]:
+                  print(f"  [{f.get('severity','?').upper()}] {f.get('title','Unknown')} — {f.get('endpoint','')}")
+              sys.exit(1)
+          else:
+              print(f"✅ No findings at or above {threshold_str} severity. Build passed.")
+          EOF
+        env:
+          SEVERITY: ${{ github.event.inputs.severity || 'high' }}
+
+      - name: Upload SARIF report to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: strix-results/scan_report.sarif
+          category: strix-security-scan
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strix-scan-results-${{ github.run_number }}
+          path: strix-results/
+          retention-days: 30
+
+      - name: Post summary to GitHub Actions
+        if: always()
+        run: |
+          RESULTS_FILE="strix-results/vulnerabilities.json"
+          if [ ! -f "$RESULTS_FILE" ]; then
+            echo "## Strix Scan — No Results" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          python3 - <<'EOF' >> $GITHUB_STEP_SUMMARY
+          import json, os
+
+          with open("strix-results/vulnerabilities.json") as f:
+              data = json.load(f)
+          findings = data if isinstance(data, list) else data.get("vulnerabilities", data.get("findings", []))
+          sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+          counts = {}
+          for f in findings:
+              s = str(f.get("severity", "unknown")).lower()
+              counts[s] = counts.get(s, 0) + 1
+
+          print("## 🛡️ Strix Security Scan Results\n")
+          print(f"**Target:** {os.environ.get('TARGET', 'N/A')}")
+          print(f"**Total findings:** {len(findings)}\n")
+          print("| Severity | Count |")
+          print("|----------|-------|")
+          for s in ("critical", "high", "medium", "low", "info"):
+              n = counts.get(s, 0)
+              if n:
+                  print(f"| {s.upper()} | {n} |")
+          if not any(counts.get(s) for s in sev_order):
+              print("\n✅ No vulnerabilities found.")
+          EOF
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
